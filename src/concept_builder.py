@@ -1,94 +1,98 @@
 import re
-import pandas as pd
-from collections import Counter
+import json
 import torch
+import numpy as np
+from collections import Counter
 from tqdm import tqdm
 
+print(">>> ConceptBuilder loaded from:", __file__)
+
+
 class ConceptBuilder:
-    def __init__(self, encoder, min_freq=50, max_concepts=15000):
+    def __init__(self, encoder, min_freq=50_000, max_concepts=15_000):
         """
-        encoder: CLIPEncoder instance from clip_encoder.py
+        encoder: CLIPEncoder
+        min_freq: minimum count to keep a unigram/bigram (LAION scale)
+        max_concepts: target size (paper uses ~15k)
         """
         self.encoder = encoder
         self.min_freq = min_freq
         self.max_concepts = max_concepts
 
-    # ------------------------------
-    # 1. Clean captions
-    # ------------------------------
     def clean_caption(self, text):
-        text = text.lower()
-        text = re.sub(r"[^a-z0-9\s]", " ", text)
-        text = re.sub(r"\s+", " ", text).strip()
+        text = text.lower().strip()
+        text = re.sub(r"[^a-z0-9 ]+", "", text)
         return text
-
-    # ------------------------------
-    # 2. Extract unigrams + bigrams
-    # ------------------------------
-    def extract_terms(self, captions):
+    
+    def extract_ngrams(self, captions):
         unigram_counter = Counter()
         bigram_counter = Counter()
 
-        for cap in captions:
-            words = cap.split()
-            unigram_counter.update(words)
+        for cap in tqdm(captions, desc="Extracting n-grams"):
+            cap = self.clean_caption(cap)
+            tokens = cap.split()
 
-            bigrams = [" ".join([words[i], words[i+1]]) 
-                       for i in range(len(words)-1)]
-            bigram_counter.update(bigrams)
+            # unigrams
+            for t in tokens:
+                unigram_counter[t] += 1
 
-        unigrams = [w for w, c in unigram_counter.items() if c >= self.min_freq]
-        bigrams = [w for w, c in bigram_counter.items() if c >= self.min_freq]
+            # bigrams
+            for i in range(len(tokens)-1):
+                bg = tokens[i] + " " + tokens[i+1]
+                bigram_counter[bg] += 1
 
-        return unigrams, bigrams
+        return unigram_counter, bigram_counter
 
-    # ------------------------------
-    # 3. Filter terms (NSFW, duplicates)
-    # ------------------------------
-    def filter_terms(self, terms):
-        banned = ["nsfw", "nude", "porn", "sex", "erotic"]
-        new_terms = []
+    def filter_ngrams(self, unigrams, bigrams):
+        # threshold filtering
+        uni = [w for w, c in unigrams.items() if c >= self.min_freq]
+        bi = [w for w, c in bigrams.items() if c >= self.min_freq]
 
-        for t in terms:
-            if not any(b in t for b in banned):
-                new_terms.append(t)
+        # remove duplicates
+        uni = list(set(uni))
+        bi = list(set(bi))
 
-        # Remove duplicates, keep first
-        return list(dict.fromkeys(new_terms))
+        # remove bigrams that are too similar to a unigram
+        filtered_bigrams = []
+        for bg in bi:
+            t1, t2 = bg.split()
+            if t1 not in uni or t2 not in uni:
+                filtered_bigrams.append(bg)
 
-    # ------------------------------
-    # 4. Encode concepts with CLIP
-    # ------------------------------
-    def encode_concept_matrix(self, concept_list, batch_size=256):
-        C = []
-        for i in tqdm(range(0, len(concept_list), batch_size)):
-            batch = concept_list[i : i + batch_size]
-            emb = self.encoder.encode_text(batch).cpu()  # normalized
-            C.append(emb)
+        # combine
+        all_concepts = uni + filtered_bigrams
 
-        C = torch.cat(C, dim=0)
-        return C  # shape [num_concepts, dim]
+        # limit size
+        all_concepts = all_concepts[:self.max_concepts]
 
-    # ------------------------------
-    # MAIN FUNCTION: Build Vocabulary
-    # ------------------------------
-    def build_from_laion(self, laion_tsv):
-        df = pd.read_csv(laion_tsv, sep="\t")
-        captions = df["caption"].astype(str).apply(self.clean_caption)
+        return all_concepts
 
-        unigrams, bigrams = self.extract_terms(captions)
+    def encode_concepts(self, concept_list):
+        embeddings = []
+        for c in tqdm(concept_list, desc="Encoding concepts"):
+            emb = self.encoder.encode_text([c])
+            embeddings.append(emb.cpu().numpy()[0])
+        return np.vstack(embeddings)
 
-        # Filter
-        unigrams = self.filter_terms(unigrams)
-        bigrams = self.filter_terms(bigrams)
+    def save(self, concept_list, C, out_dir="data/"):
+        # save list
+        with open(f"{out_dir}/concepts.json", "w") as f:
+            json.dump(concept_list, f, indent=2)
 
-        # Combine
-        concepts = unigrams + bigrams
-        concepts = concepts[: self.max_concepts]
+        # save embeddings
+        torch.save(torch.tensor(C), f"{out_dir}/C.pt")
 
-        print(f"Final vocabulary size: {len(concepts)}")
+    def build(self, captions, out_dir="data/"):
+        # 1. n-gram extraction
+        uni, bi = self.extract_ngrams(captions)
 
-        # Encode with CLIP
-        C = self.encode_concept_matrix(concepts)
+        # 2. filtering
+        concept_list = self.filter_ngrams(uni, bi)
 
-        return concepts, C
+        # 3. encoding with CLIP
+        C = self.encode_concepts(concept_list)
+
+        # 4. save
+        self.save(concept_list, C, out_dir)
+
+        return concept_list, C
