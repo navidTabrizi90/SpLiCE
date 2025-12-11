@@ -1,7 +1,10 @@
-open_clip_torch
-torch
+torch>=1.9.0
+torchvision
+open_clip_torch>=2.0.0
 numpy
+pandas
 scikit-learn
-tqdm
 Pillow
-matplotlib
+tqdm
+ftfy
+regex
